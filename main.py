@@ -1,91 +1,175 @@
-# Import OpenAI and supporting libraries
+import json
 import os
-from itertools import islice
+from pathlib import Path
+
 from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
-
 API_KEY = os.getenv("OPENAI_API_KEY")
+MODEL = "gpt-4o-mini"
+DEFAULT_LECTURE_FILE = "physics_lecture.txt"
+DEFAULT_QUESTION_COUNT = 5
 
-if not API_KEY:
-    raise SystemExit("OPENAI_API_KEY is not set. Add it to your .env file.")
+
+SYSTEM_PROMPT = """
+You are a teaching assistant that creates clear, accurate multiple-choice quiz questions from educational text.
+Use only facts from the supplied lecture text. Create plausible distractors, but ensure exactly one answer is correct.
+Return valid JSON only.
+"""
+
+
+def get_client():
+    api_key = os.getenv("OPENAI_API_KEY")
+
+    if not api_key:
+        raise SystemExit("OPENAI_API_KEY is not set. Add it to your .env file.")
+
+    return OpenAI(api_key=api_key)
 
 
 def read_text_from_file(filename):
-    """
-    Reads the first 500 lines of content from a file and returns it as a string.
-    Args: filename (str): The name of the file to read.
-    Returns: str: The content of the file as a string, or an empty string if the file is not found.
-    """
+    """Read lecture text from a file next to this script."""
+    lecture_path = Path(__file__).resolve().with_name(filename)
+
     try:
-        with open(filename, 'r') as file:
-            return ''.join(islice(file, 500))
+        content = lecture_path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        print(f"Error: {filename} not found.")
-        return ""
+        raise SystemExit(f"Error: {lecture_path.name} was not found next to main.py.") from None
 
-# Read content from the file
-content = read_text_from_file("physics_lecture.txt")
+    if not content.strip():
+        raise SystemExit(f"Error: {lecture_path.name} is empty.")
 
-# Set up the OpenAI client
-client = OpenAI(api_key=API_KEY)
+    return content
 
-# Setting up the recommended model
-model = "gpt-4o-mini"
 
-# Define the system prompt (describing the assistant's behavior)
-system_prompt = """
-You are a teaching assistant that generates multiple-choice questions from a provided educational text.
-Your role is to assist educators by creating quiz questions with one correct answer.
+def build_user_prompt(text, question_count, difficulty):
+    return f"""
+Generate {question_count} multiple-choice quiz questions from the lecture text below.
+
+Rules:
+- Difficulty: {difficulty}
+- Cover different parts of the lecture where possible.
+- Each question must have exactly four options.
+- `answer_index` must be 0, 1, 2, or 3.
+- Include a short explanation for the correct answer.
+- Return JSON in exactly this shape:
+{{
+  "questions": [
+    {{
+      "question": "Question text",
+      "options": ["Option A", "Option B", "Option C", "Option D"],
+      "answer_index": 0,
+      "explanation": "Why the answer is correct",
+      "topic": "Lecture topic",
+      "difficulty": "{difficulty}"
+    }}
+  ]
+}}
+
+Lecture text:
+{text}
 """
 
-# Define the user prompt template (input provided by the user)
-user_prompt = """
-Generate a multiple-choice quiz question from the given text:
 
-Format:
-Question: <Generated Question>
-Options:
-a) <Option 1>
-b) <Option 2>
-c) <Option 3>
-d) <Option 4>
-Answer: <Correct Option>
-"""
+def generate_quiz_questions(text, question_count=DEFAULT_QUESTION_COUNT, difficulty="medium"):
+    client = get_client()
 
-def generate_quiz_questions(text):
-    """
-    Generates a list of multiple-choice quiz questions and answers from the provided text.
-    Args: text (str): The input text from which quiz questions are generated.
-    Returns: list: A list of dictionaries containing quiz questions, options, and correct answers.
-    """
-    # List to store generated quiz questions and answers
-    quiz_data_list = []
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": build_user_prompt(text, question_count, difficulty)},
+        ],
+        response_format={"type": "json_object"},
+        max_tokens=1500,
+    )
 
-    for i in range(5):
-        
-        # Get a response from the OpenAI API to generate the quiz questions
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt + text},
-                {"role": "user", "content": user_prompt}
-            ],
-            max_tokens=500
+    content = response.choices[0].message.content
+    quiz_data = json.loads(content)
+    return validate_quiz(quiz_data, question_count)
+
+
+def validate_quiz(quiz_data, expected_count):
+    questions = quiz_data.get("questions")
+
+    if not isinstance(questions, list) or not questions:
+        raise ValueError("The model did not return a questions list.")
+
+    validated_questions = []
+
+    for index, question in enumerate(questions[:expected_count], start=1):
+        options = question.get("options")
+        answer_index = question.get("answer_index")
+
+        if not question.get("question"):
+            raise ValueError(f"Question {index} is missing question text.")
+        if not isinstance(options, list) or len(options) != 4:
+            raise ValueError(f"Question {index} must have exactly four options.")
+        if answer_index not in range(4):
+            raise ValueError(f"Question {index} has an invalid answer index.")
+
+        validated_questions.append(
+            {
+                "question": question["question"],
+                "options": options,
+                "answer_index": answer_index,
+                "explanation": question.get("explanation", "No explanation provided."),
+                "topic": question.get("topic", "General"),
+                "difficulty": question.get("difficulty", "medium"),
+            }
         )
 
-        # Extract the questions and answers from the response
-        question_and_answer = response.choices[0].message.content
+    return validated_questions
 
-        # Add the generated question and answer to the list
-        quiz_data_list.append(question_and_answer)
 
-    return quiz_data_list
+def ask_for_answer():
+    answer_map = {"a": 0, "b": 1, "c": 2, "d": 3}
 
-# Generate quiz questions from the content provided
-quiz_data = generate_quiz_questions(content)
+    while True:
+        answer = input("Your answer (a/b/c/d): ").strip().lower()
 
-# View the first question and answer set
-quiz_data[0]
+        if answer in answer_map:
+            return answer_map[answer]
+
+        print("Please enter a, b, c, or d.")
+
+
+def run_quiz(questions):
+    score = 0
+    missed_topics = []
+    option_labels = ["a", "b", "c", "d"]
+
+    for question_number, question in enumerate(questions, start=1):
+        print(f"\nQuestion {question_number}: {question['question']}")
+
+        for option_label, option in zip(option_labels, question["options"]):
+            print(f"{option_label}) {option}")
+
+        selected_index = ask_for_answer()
+        correct_index = question["answer_index"]
+
+        if selected_index == correct_index:
+            score += 1
+            print("Correct.")
+        else:
+            missed_topics.append(question["topic"])
+            print(f"Incorrect. The correct answer was {option_labels[correct_index]}.")
+
+        print(f"Explanation: {question['explanation']}")
+
+    print(f"\nFinal score: {score}/{len(questions)}")
+
+    if missed_topics:
+        print("Topics to revise: " + ", ".join(sorted(set(missed_topics))))
+
+
+def main():
+    lecture_text = read_text_from_file(DEFAULT_LECTURE_FILE)
+    questions = generate_quiz_questions(lecture_text)
+    run_quiz(questions)
+
+
+if __name__ == "__main__":
+    main()
